@@ -1,0 +1,21 @@
+[Unit]
+Description=srt for channel %i
+After=network.target
+StartLimitInterval=300s
+StartLimitBurst=8
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/srt/%i.conf
+ExecStart=/usr/local/bin/srt-live-transmit \
+  ${LOGFA} \
+  ${LOGLEVEL} \
+  ${VERBOSE} \
+  ${SRC} \
+  ${DST}
+PIDFile=/var/run/scte35_%i.pid
+Restart=always
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
