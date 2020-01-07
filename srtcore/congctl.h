@@ -79,12 +79,18 @@ public:
     // 1. The congctl is individual, so don't copy it. Set NULL.
     // 2. The selected name is copied so that it's configured correctly.
     SrtCongestion(const SrtCongestion& source): congctl(), selector(source.selector) {}
+    void operator=(const SrtCongestion& source) { congctl = 0; selector = source.selector; }
 
     // This function will be called by the parent CUDT
     // in appropriate time. It should select appropriate
     // congctl basing on the value in selector, then
     // pin oneself in into CUDT for receiving event signals.
     bool configure(CUDT* parent);
+
+    // This function will intentionally delete the contained object.
+    // This makes future calls to ready() return false. Calling
+    // configure on it again will create it again.
+    void dispose();
 
     // Will delete the pinned in congctl object.
     // This must be defined in *.cpp file due to virtual
@@ -156,19 +162,17 @@ public:
     // If not, it will be internally calculated.
     virtual int RTO() { return 0; }
 
-    // How many packets to send one ACK, in packets.
-    // If user-defined, will return nonzero value.  It can enforce extra ACKs
-    // beside those calculated by ACK, sent only when the number of packets
-    // received since the last EXP that fired "fat" ACK does not exceed this
-    // value.
-    virtual int ACKInterval() { return 0; }
+    // Maximum number of packets to trigger ACK sending.
+    // Specifies the number of packets to receive before sending the ACK.
+    // Used by CUDT together with ACKTimeout_us() to trigger ACK packet sending.
+    virtual int ACKMaxPackets() const { return 0; }
 
-    // Periodical timer to send an ACK, in microseconds.
-    // If user-defined, this value in microseconds will be used to calculate
+    // Periodical interval to send an ACK, in microseconds.
+    // If user-defined, this value will be used to calculate
     // the next ACK time every time ACK is considered to be sent (see CUDT::checkTimers).
     // Otherwise this will be calculated internally in CUDT, normally taken
-    // from CPacket::SYN_INTERVAL.
-    virtual int ACKPeriod() { return 0; }
+    // from CUDT::COMM_SYN_INTERVAL_US.
+    virtual int ACKTimeout_us() const { return 0; }
 
     // Called when the settings concerning m_llMaxBW were changed.
     // Arg 1: value of CUDT::m_llMaxBW
@@ -188,15 +192,15 @@ public:
 
     virtual SrtCongestion::RexmitMethod rexmitMethod() = 0; // Implementation enforced.
 
-    virtual uint64_t updateNAKInterval(uint64_t nakint_tk, int rcv_speed, size_t loss_length)
+    virtual int64_t updateNAKInterval(int64_t nakint_us, int rcv_speed, size_t loss_length)
     {
         if (rcv_speed > 0)
-            nakint_tk += (loss_length * uint64_t(1000000) / rcv_speed) * CTimer::getCPUFrequency();
+            nakint_us += (loss_length * int64_t(1000000) / rcv_speed);
 
-        return nakint_tk;
+        return nakint_us;
     }
 
-    virtual uint64_t minNAKInterval()
+    virtual int64_t minNAKInterval()
     {
         return 0; // Leave default
     }

@@ -13,6 +13,8 @@ written by
    Haivision Systems Inc.
  *****************************************************************************/
 
+#include "platform_sys.h"
+
 #include <cstring>
 #include <string>
 #include <sstream>
@@ -135,7 +137,7 @@ int CCryptoControl::processSrtMsg_KMREQ(
 #define KMREQ_RESULT_REJECTION() { srtlen = 1; goto HSv4_ErrorReport; }
 
     int rc = HAICRYPT_OK; // needed before 'goto' run from KMREQ_RESULT_REJECTION macro
-    bool SRT_ATR_UNUSED wasb4 = false;
+    bool wasb4 SRT_ATR_UNUSED = false;
     size_t sek_len = 0;
 
     // What we have to do:
@@ -422,7 +424,7 @@ void CCryptoControl::sendKeysToPeer(Whether2RegenKm regen SRT_ATR_UNUSED)
         return;
     }
 #ifdef SRT_ENABLE_ENCRYPTION
-    uint64_t now = 0;
+    srt::sync::steady_clock::time_point now = srt::sync::steady_clock::now();
     /*
      * Crypto Key Distribution to peer:
      * If...
@@ -432,8 +434,8 @@ void CCryptoControl::sendKeysToPeer(Whether2RegenKm regen SRT_ATR_UNUSED)
      * - last sent Keying Material req should have been replied (RTT*1.5 elapsed);
      * then (re-)send handshake request.
      */
-    if (  ((m_SndKmMsg[0].iPeerRetry > 0) || (m_SndKmMsg[1].iPeerRetry > 0))
-      &&  ((m_SndKmLastTime + ((m_parent->RTT() * 3)/2)) <= (now = CTimer::getTime())))
+    if (((m_SndKmMsg[0].iPeerRetry > 0) || (m_SndKmMsg[1].iPeerRetry > 0))
+        && ((m_SndKmLastTime + srt::sync::microseconds_from((m_parent->RTT() * 3)/2)) <= now))
     {
         for (int ki = 0; ki < 2; ki++)
         {
@@ -448,17 +450,14 @@ void CCryptoControl::sendKeysToPeer(Whether2RegenKm regen SRT_ATR_UNUSED)
         }
     }
 
-    if (now == 0)
-    {
-        HLOGC(mglog.Debug, log << "sendKeysToPeer: NO KEYS RESENT, will " <<
-                (regen ? "" : "NOT ") << "regenerate.");
-    }
 
     if (regen)
+    {
         regenCryptoKm(
-                true, // send UMSG_EXT + SRT_CMD_KMREQ to the peer, if regenerated the key
-                false // Do not apply the regenerated key to the to the receiver context
-                ); // regenerate and send
+            true, // send UMSG_EXT + SRT_CMD_KMREQ to the peer, if regenerated the key
+            false // Do not apply the regenerated key to the to the receiver context
+        ); // regenerate and send
+    }
 #endif
 }
 
@@ -537,7 +536,7 @@ void CCryptoControl::regenCryptoKm(bool sendit, bool bidirectional)
             << "; key[1]: len=" << m_SndKmMsg[1].MsgLen << " retry=" << m_SndKmMsg[1].iPeerRetry);
 
     if (sent)
-        m_SndKmLastTime = CTimer::getTime();
+        m_SndKmLastTime = srt::sync::steady_clock::now();
 }
 #endif
 
@@ -555,7 +554,6 @@ m_bErrorReported(false)
 
     m_KmSecret.len = 0;
     //send
-    m_SndKmLastTime = 0;
     m_SndKmMsg[0].MsgLen = 0;
     m_SndKmMsg[0].iPeerRetry = 0;
     m_SndKmMsg[1].MsgLen = 0;
@@ -696,10 +694,13 @@ bool CCryptoControl::createCryptoCtx(ref_t<HaiCrypt_Handle> hCrypto, size_t keyl
 
     HaiCrypt_Cfg crypto_cfg;
     memset(&crypto_cfg, 0, sizeof(crypto_cfg));
-
+#if 0//test key refresh (fast rate)
+    m_KmRefreshRatePkt = 2000;
+    m_KmPreAnnouncePkt = 500;
+#endif
     crypto_cfg.flags = HAICRYPT_CFG_F_CRYPTO | (cdir == HAICRYPT_CRYPTO_DIR_TX ? HAICRYPT_CFG_F_TX : 0);
     crypto_cfg.xport = HAICRYPT_XPT_SRT;
-    crypto_cfg.cipher = HaiCryptCipher_Get_Instance();
+    crypto_cfg.cryspr = HaiCryptCryspr_Get_Instance();
     crypto_cfg.key_len = (size_t)keylen;
     crypto_cfg.data_max_len = HAICRYPT_DEF_DATA_MAX_LENGTH;    //MTU
     crypto_cfg.km_tx_period_ms = 0;//No HaiCrypt KM inject period, handled in SRT;
@@ -708,7 +709,7 @@ bool CCryptoControl::createCryptoCtx(ref_t<HaiCrypt_Handle> hCrypto, size_t keyl
     crypto_cfg.secret = m_KmSecret;
     //memcpy(&crypto_cfg.secret, &m_KmSecret, sizeof(crypto_cfg.secret));
 
-    HLOGC(mglog.Debug, log << "CRYPTO CFG: flags=" << CryptoFlags(crypto_cfg.flags) << " xport=" << crypto_cfg.xport << " cipher=" << crypto_cfg.cipher
+    HLOGC(mglog.Debug, log << "CRYPTO CFG: flags=" << CryptoFlags(crypto_cfg.flags) << " xport=" << crypto_cfg.xport << " cryspr=" << crypto_cfg.cryspr
         << " keylen=" << crypto_cfg.key_len << " passphrase_length=" << crypto_cfg.secret.len);
 
     if (HaiCrypt_Create(&crypto_cfg, &hCrypto.get()) != HAICRYPT_OK)
@@ -836,6 +837,7 @@ EncryptionStatus CCryptoControl::decrypt(ref_t<CPacket> r_packet SRT_ATR_UNUSED)
 CCryptoControl::~CCryptoControl()
 {
 #ifdef SRT_ENABLE_ENCRYPTION
+    close();
     if (m_hSndCrypto)
     {
         HaiCrypt_Close(m_hSndCrypto);

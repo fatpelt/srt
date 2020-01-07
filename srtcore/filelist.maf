@@ -9,15 +9,18 @@ common.cpp
 core.cpp
 crypto.cpp
 epoll.cpp
+fec.cpp
 handshake.cpp
 list.cpp
 md5.cpp
 packet.cpp
+packetfilter.cpp
 queue.cpp
 congctl.cpp
 srt_c_api.cpp
 window.cpp
 srt_compat.c
+sync.cpp
 
 PUBLIC HEADERS
 srt.h
@@ -43,6 +46,7 @@ logging.h
 md5.h
 netinet_any.h
 packet.h
+sync.h
 queue.h
 congctl.h
 srt4udt.h
@@ -51,3 +55,5 @@ threadname.h
 utilities.h
 window.h
 
+SOURCES WIN32 SHARED
+srt_shared.rc

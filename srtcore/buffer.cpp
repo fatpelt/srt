@@ -50,6 +50,8 @@ modified by
    Haivision Systems Inc.
 *****************************************************************************/
 
+#include "platform_sys.h"
+
 #include <cstring>
 #include <cmath>
 #include "buffer.h"
@@ -59,32 +61,29 @@ modified by
 
 using namespace std;
 using namespace srt_logging;
+using namespace srt::sync;
 
-CSndBuffer::CSndBuffer(int size, int mss):
-m_BufLock(),
-m_pBlock(NULL),
-m_pFirstBlock(NULL),
-m_pCurrBlock(NULL),
-m_pLastBlock(NULL),
-m_pBuffer(NULL),
-m_iNextMsgNo(1),
-m_iSize(size),
-m_iMSS(mss),
-m_iCount(0)
-,m_iBytesCount(0)
-,m_ullLastOriginTime_us(0)
+CSndBuffer::CSndBuffer(int size, int mss)
+    : m_BufLock()
+    , m_pBlock(NULL)
+    , m_pFirstBlock(NULL)
+    , m_pCurrBlock(NULL)
+    , m_pLastBlock(NULL)
+    , m_pBuffer(NULL)
+    , m_iNextMsgNo(1)
+    , m_iSize(size)
+    , m_iMSS(mss)
+    , m_iCount(0)
+    , m_iBytesCount(0)
 #ifdef SRT_ENABLE_SNDBUFSZ_MAVG
-,m_LastSamplingTime(0)
-,m_iCountMAvg(0)
-,m_iBytesCountMAvg(0)
-,m_TimespanMAvg(0)
+    , m_iCountMAvg(0)
+    , m_iBytesCountMAvg(0)
+    , m_TimespanMAvg(0)
 #endif
-,m_iInRatePktsCount(0)
-,m_iInRateBytesCount(0)
-,m_InRateStartTime(0)
-,m_InRatePeriod(CUDT::SND_INPUTRATE_FAST_START_US)   // 0.5 sec (fast start)
-,m_iInRateBps(CUDT::SND_INPUTRATE_INITIAL_BPS)
-,m_iAvgPayloadSz(SRT_LIVE_DEF_PLSIZE)
+    , m_iInRatePktsCount(0)
+    , m_iInRateBytesCount(0)
+    , m_InRatePeriod(INPUTRATE_FAST_START_US)   // 0.5 sec (fast start)
+    , m_iInRateBps(INPUTRATE_INITIAL_BYTESPS)
 {
    // initial physical buffer of "size"
    m_pBuffer = new Buffer;
@@ -156,7 +155,7 @@ void CSndBuffer::addBuffer(const char* data, int len, int ttl, bool order, uint6
         increase();
     }
 
-    uint64_t time = CTimer::getTime();
+    const steady_clock::time_point time = steady_clock::now();
     int32_t inorder = order ? MSGNO_PACKET_INORDER::mask : 0;
 
     HLOGC(dlog.Debug, log << CONID() << "addBuffer: adding "
@@ -188,11 +187,12 @@ void CSndBuffer::addBuffer(const char* data, int len, int ttl, bool order, uint6
         // [PB_SOLO] - 1 packet per message
 
         s->m_ullSourceTime_us = srctime;
-        s->m_ullOriginTime_us = time;
+        s->m_tsOriginTime = time;
         s->m_iTTL = ttl;
 
         // XXX unchecked condition: s->m_pNext == NULL.
         // Should never happen, as the call to increase() should ensure enough buffers.
+        SRT_ASSERT(s->m_pNext);
         s = s->m_pNext;
     }
     m_pLastBlock = s;
@@ -201,9 +201,9 @@ void CSndBuffer::addBuffer(const char* data, int len, int ttl, bool order, uint6
     m_iCount += size;
 
     m_iBytesCount += len;
-    m_ullLastOriginTime_us = time;
+    m_tsLastOriginTime = time;
 
-    updInputRate(time, size, len);
+    updateInputRate(time, size, len);
 
 #ifdef SRT_ENABLE_SNDBUFSZ_MAVG
     updAvgBufSize(time);
@@ -225,65 +225,45 @@ void CSndBuffer::addBuffer(const char* data, int len, int ttl, bool order, uint6
 
 void CSndBuffer::setInputRateSmpPeriod(int period)
 {
-   m_InRatePeriod = (uint64_t)period; //(usec) 0=no input rate calculation
+    m_InRatePeriod = (uint64_t)period; //(usec) 0=no input rate calculation
 }
 
-void CSndBuffer::updInputRate(uint64_t time, int pkts, int bytes)
+void CSndBuffer::updateInputRate(const steady_clock::time_point& time, int pkts, int bytes)
 {
-   if (m_InRatePeriod == 0)
-      ;//no input rate calculation
-   else if (m_InRateStartTime == 0)
-      m_InRateStartTime = time;
-   else
-   {
-      m_iInRatePktsCount += pkts;
-      m_iInRateBytesCount += bytes;
-      if ((time - m_InRateStartTime) > m_InRatePeriod) {
-         //Payload average size
-         m_iAvgPayloadSz = m_iInRateBytesCount / m_iInRatePktsCount;
-         //Required Byte/sec rate (payload + headers)
-         m_iInRateBytesCount += (m_iInRatePktsCount * CPacket::SRT_DATA_HDR_SIZE);
-         m_iInRateBps = (int)(((int64_t)m_iInRateBytesCount * 1000000) / (time - m_InRateStartTime));
+    //no input rate calculation
+    if (m_InRatePeriod == 0)
+        return;
 
-         HLOGC(dlog.Debug, log << "updInputRate: pkts:" << m_iInRateBytesCount << " bytes:" << m_iInRatePktsCount
-                 << " avg=" << m_iAvgPayloadSz << " rate=" << (m_iInRateBps*8)/1000
-                 << "kbps interval=" << (time - m_InRateStartTime));
-
-         m_iInRatePktsCount = 0;
-         m_iInRateBytesCount = 0;
-         m_InRateStartTime = time;
-      }
-   }
-}
-
-int CSndBuffer::getInputRate(ref_t<int> r_payloadsz, ref_t<uint64_t> r_period)
-{
-    int& payloadsz = *r_payloadsz;
-    uint64_t& period = *r_period;
-    uint64_t time = CTimer::getTime();
-
-    if ((m_InRatePeriod != 0)
-            &&  (m_InRateStartTime != 0) 
-            &&  ((time - m_InRateStartTime) > m_InRatePeriod))
+    if (is_zero(m_tsInRateStartTime))
     {
-        //Packet size with headers
-        if (m_iInRatePktsCount == 0)
-            m_iAvgPayloadSz = 0;
-        else
-            m_iAvgPayloadSz = m_iInRateBytesCount / m_iInRatePktsCount;
+        m_tsInRateStartTime = time;
+        return;
+    }
 
-        //include packet headers: SRT + UDP + IP
-        int64_t llBytesCount = (int64_t)m_iInRateBytesCount + (m_iInRatePktsCount * (CPacket::HDR_SIZE + CPacket::UDP_HDR_SIZE));
-        //Byte/sec rate
-        m_iInRateBps = (int)((llBytesCount * 1000000) / (time - m_InRateStartTime));
+    m_iInRatePktsCount  += pkts;
+    m_iInRateBytesCount += bytes;
+
+    // Trigger early update in fast start mode
+    const bool early_update = (m_InRatePeriod < INPUTRATE_RUNNING_US)
+        && (m_iInRatePktsCount > INPUTRATE_MAX_PACKETS);
+
+    const uint64_t period_us = count_microseconds(time - m_tsInRateStartTime);
+    if (early_update || period_us > m_InRatePeriod)
+    {
+        //Required Byte/sec rate (payload + headers)
+        m_iInRateBytesCount += (m_iInRatePktsCount * CPacket::SRT_DATA_HDR_SIZE);
+        m_iInRateBps = (int)(((int64_t)m_iInRateBytesCount * 1000000) / period_us);
+        HLOGC(dlog.Debug, log << "updateInputRate: pkts:" << m_iInRateBytesCount << " bytes:" << m_iInRatePktsCount
+                << " rate=" << (m_iInRateBps*8)/1000
+                << "kbps interval=" << period_us);
         m_iInRatePktsCount = 0;
         m_iInRateBytesCount = 0;
-        m_InRateStartTime = time;
+        m_tsInRateStartTime = time;
+
+        setInputRateSmpPeriod(INPUTRATE_RUNNING_US);
     }
-    payloadsz = m_iAvgPayloadSz;
-    period = m_InRatePeriod;
-    return(m_iInRateBps);
 }
+
 
 int CSndBuffer::addBufferFromFile(fstream& ifs, int len)
 {
@@ -349,7 +329,7 @@ int CSndBuffer::addBufferFromFile(fstream& ifs, int len)
    return total;
 }
 
-int CSndBuffer::readData(char** data, int32_t& msgno_bitset, uint64_t& srctime, int kflgs)
+int CSndBuffer::readData(char** data, int32_t& msgno_bitset, steady_clock::time_point& srctime, int kflgs)
 {
    // No data to read
    if (m_pCurrBlock == m_pLastBlock)
@@ -394,9 +374,11 @@ int CSndBuffer::readData(char** data, int32_t& msgno_bitset, uint64_t& srctime, 
    }
    msgno_bitset = m_pCurrBlock->m_iMsgNoBitset;
 
-   srctime =
+   // TODO: FR #930. Use source time if it is provided.
+   srctime = m_pCurrBlock->m_tsOriginTime;
+   /*srctime =
       m_pCurrBlock->m_ullSourceTime_us ? m_pCurrBlock->m_ullSourceTime_us :
-      m_pCurrBlock->m_ullOriginTime_us;
+      m_pCurrBlock->m_tsOriginTime;*/
 
    m_pCurrBlock = m_pCurrBlock->m_pNext;
 
@@ -405,7 +387,7 @@ int CSndBuffer::readData(char** data, int32_t& msgno_bitset, uint64_t& srctime, 
    return readlen;
 }
 
-int CSndBuffer::readData(char** data, const int offset, int32_t& msgno_bitset, uint64_t& srctime, int& msglen)
+int CSndBuffer::readData(char** data, const int offset, int32_t& msgno_bitset, steady_clock::time_point& srctime, int& msglen)
 {
    CGuard bufferguard(m_BufLock);
 
@@ -430,7 +412,7 @@ int CSndBuffer::readData(char** data, const int offset, int32_t& msgno_bitset, u
    // if found block is stale
    // (This is for messages that have declared TTL - messages that fail to be sent
    // before the TTL defined time comes, will be dropped).
-   if ((p->m_iTTL >= 0) && ((CTimer::getTime() - p->m_ullOriginTime_us) / 1000 > (uint64_t)p->m_iTTL))
+   if ((p->m_iTTL >= 0) && (count_milliseconds(steady_clock::now() - p->m_tsOriginTime) > p->m_iTTL))
    {
       int32_t msgno = p->getMsgSeq();
       msglen = 1;
@@ -466,9 +448,11 @@ int CSndBuffer::readData(char** data, const int offset, int32_t& msgno_bitset, u
    // flags.
    msgno_bitset = p->m_iMsgNoBitset;
 
-   srctime = 
-      p->m_ullSourceTime_us ? p->m_ullSourceTime_us :
-      p->m_ullOriginTime_us;
+   // TODO: FR #930. Use source time if it is provided.
+   srctime = m_pCurrBlock->m_tsOriginTime;
+   /*srctime =
+      m_pCurrBlock->m_ullSourceTime_us ? m_pCurrBlock->m_ullSourceTime_us :
+      m_pCurrBlock->m_tsOriginTime;*/
 
    HLOGC(dlog.Debug, log << CONID() << "CSndBuffer: extracting packet size=" << readlen << " to send [REXMIT]");
 
@@ -493,7 +477,7 @@ void CSndBuffer::ackData(int offset)
    m_iCount -= offset;
 
 #ifdef SRT_ENABLE_SNDBUFSZ_MAVG
-   updAvgBufSize(CTimer::getTime());
+   updAvgBufSize(steady_clock::now());
 #endif
 
    CTimer::triggerEvent();
@@ -513,32 +497,32 @@ int CSndBuffer::getAvgBufSize(ref_t<int> r_bytes, ref_t<int> r_tsp)
     CGuard bufferguard(m_BufLock); /* Consistency of pkts vs. bytes vs. spantime */
 
     /* update stats in case there was no add/ack activity lately */
-    updAvgBufSize(CTimer::getTime());
+    updAvgBufSize(steady_clock::now());
 
     bytes = m_iBytesCountMAvg;
     timespan = m_TimespanMAvg;
     return(m_iCountMAvg);
 }
 
-void CSndBuffer::updAvgBufSize(uint64_t now)
+void CSndBuffer::updAvgBufSize(const steady_clock::time_point& now)
 {
-   uint64_t elapsed = (now - m_LastSamplingTime) / 1000; //ms since last sampling
+   const uint64_t elapsed_ms = count_milliseconds(now - m_tsLastSamplingTime); //ms since last sampling
 
-   if ((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 > elapsed)
+   if ((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 > elapsed_ms)
       return;
 
-   if (1000000 < elapsed)
+   if (1000 < elapsed_ms)
    {
       /* No sampling in last 1 sec, initialize average */
       m_iCountMAvg = getCurrBufSize(Ref(m_iBytesCountMAvg), Ref(m_TimespanMAvg));
-      m_LastSamplingTime = now;
+      m_tsLastSamplingTime = now;
    } 
-   else //((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 <= elapsed)
+   else //((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 <= elapsed_ms)
    {
       /*
       * weight last average value between -1 sec and last sampling time (LST)
       * and new value between last sampling time and now
-      *                                      |elapsed|
+      *                                      |elapsed_ms|
       *   +----------------------------------+-------+
       *  -1                                 LST      0(now)
       */
@@ -546,14 +530,14 @@ void CSndBuffer::updAvgBufSize(uint64_t now)
       int bytescount;
       int count = getCurrBufSize(Ref(bytescount), Ref(instspan));
 
-      HLOGC(dlog.Debug, log << "updAvgBufSize: " << elapsed
+      HLOGC(dlog.Debug, log << "updAvgBufSize: " << elapsed_ms
               << ": " << count << " " << bytescount
               << " " << instspan << "ms");
 
-      m_iCountMAvg      = (int)(((count      * (1000 - elapsed)) + (count      * elapsed)) / 1000);
-      m_iBytesCountMAvg = (int)(((bytescount * (1000 - elapsed)) + (bytescount * elapsed)) / 1000);
-      m_TimespanMAvg    = (int)(((instspan   * (1000 - elapsed)) + (instspan   * elapsed)) / 1000);
-      m_LastSamplingTime = now;
+      m_iCountMAvg      = (int)(((count      * (1000 - elapsed_ms)) + (count      * elapsed_ms)) / 1000);
+      m_iBytesCountMAvg = (int)(((bytescount * (1000 - elapsed_ms)) + (bytescount * elapsed_ms)) / 1000);
+      m_TimespanMAvg    = (int)(((instspan   * (1000 - elapsed_ms)) + (instspan   * elapsed_ms)) / 1000);
+      m_tsLastSamplingTime = now;
    }
 }
 
@@ -567,19 +551,19 @@ int CSndBuffer::getCurrBufSize(ref_t<int> bytes, ref_t<int> timespan)
    * Also, if there is only one pkt in buffer, the time difference will be 0.
    * Therefore, always add 1 ms if not empty.
    */
-   *timespan = 0 < m_iCount ? int((m_ullLastOriginTime_us - m_pFirstBlock->m_ullOriginTime_us) / 1000) + 1 : 0;
+   *timespan = 0 < m_iCount ? count_milliseconds(m_tsLastOriginTime - m_pFirstBlock->m_tsOriginTime) + 1 : 0;
 
    return m_iCount;
 }
 
-int CSndBuffer::dropLateData(int &bytes, uint64_t latetime)
+int CSndBuffer::dropLateData(int& bytes, const steady_clock::time_point& too_late_time)
 {
    int dpkts = 0;
    int dbytes = 0;
    bool move = false;
 
    CGuard bufferguard(m_BufLock);
-   for (int i = 0; i < m_iCount && m_pFirstBlock->m_ullOriginTime_us < latetime; ++ i)
+   for (int i = 0; i < m_iCount && m_pFirstBlock->m_tsOriginTime < too_late_time; ++ i)
    {
       dpkts++;
       dbytes += m_pFirstBlock->m_iLength;
@@ -594,7 +578,7 @@ int CSndBuffer::dropLateData(int &bytes, uint64_t latetime)
    bytes = dbytes;
 
 #ifdef SRT_ENABLE_SNDBUFSZ_MAVG
-   updAvgBufSize(CTimer::getTime());
+   updAvgBufSize(steady_clock::now());
 #endif /* SRT_ENABLE_SNDBUFSZ_MAVG */
 
 // CTimer::triggerEvent();
@@ -697,9 +681,9 @@ void CSndBuffer::increase()
 //const int CRcvBuffer::TSBPD_DRIFT_PRT_SAMPLES = 200;   // ACK-ACK packets
 #endif
 
-CRcvBuffer::CRcvBuffer(CUnitQueue* queue, int bufsize):
+CRcvBuffer::CRcvBuffer(CUnitQueue* queue, int bufsize_pkts):
 m_pUnit(NULL),
-m_iSize(bufsize),
+m_iSize(bufsize_pkts),
 m_pUnitQueue(queue),
 m_iStartPos(0),
 m_iLastAckPos(0),
@@ -711,14 +695,9 @@ m_iNotch(0)
 ,m_iAckedBytesCount(0)
 ,m_iAvgPayloadSz(7*188)
 ,m_bTsbPdMode(false)
-,m_uTsbPdDelay(0)
-,m_ullTsbPdTimeBase(0)
+,m_tdTsbPdDelay(0)
 ,m_bTsbPdWrapCheck(false)
-//,m_iTsbPdDrift(0)
-//,m_TsbPdDriftSum(0)
-//,m_iTsbPdDriftNbSamples(0)
 #ifdef SRT_ENABLE_RCVBUFSZ_MAVG
-,m_LastSamplingTime(0)
 ,m_TimespanMAvg(0)
 ,m_iCountMAvg(0)
 ,m_iBytesCountMAvg(0)
@@ -781,11 +760,17 @@ void CRcvBuffer::countBytes(int pkts, int bytes, bool acked)
 
 int CRcvBuffer::addData(CUnit* unit, int offset)
 {
-   int pos = (m_iLastAckPos + offset) % m_iSize;
+   SRT_ASSERT(unit != NULL);
+   if (offset >= getAvailBufSize())
+       return -1;
+
+   const int pos = (m_iLastAckPos + offset) % m_iSize;
    if (offset >= m_iMaxPos)
       m_iMaxPos = offset + 1;
 
    if (m_pUnit[pos] != NULL) {
+      HLOGC(dlog.Debug, log << "addData: unit %" << unit->m_Packet.m_iSeqNo
+              << " rejected, already exists");
       return -1;
    }
    m_pUnit[pos] = unit;
@@ -793,61 +778,68 @@ int CRcvBuffer::addData(CUnit* unit, int offset)
 
    m_pUnitQueue->makeUnitGood(unit);
 
+   HLOGC(dlog.Debug, log << "addData: unit %" << unit->m_Packet.m_iSeqNo
+           << " accepted, off=" << offset << " POS=" << pos);
    return 0;
 }
 
 int CRcvBuffer::readBuffer(char* data, int len)
 {
-   int p = m_iStartPos;
-   int lastack = m_iLastAckPos;
-   int rs = len;
+    int p = m_iStartPos;
+    int lastack = m_iLastAckPos;
+    int rs = len;
 #if ENABLE_HEAVY_LOGGING
-   char* begin = data;
+    char* begin = data;
 #endif
 
-   uint64_t now = (m_bTsbPdMode ? CTimer::getTime() : uint64_t());
+    const steady_clock::time_point now = (m_bTsbPdMode ? steady_clock::now() : steady_clock::time_point());
 
-   HLOGC(dlog.Debug, log << CONID() << "readBuffer: start=" << p << " lastack=" << lastack);
-   while ((p != lastack) && (rs > 0))
-   {
-      if (m_bTsbPdMode)
-      {
-          HLOGC(dlog.Debug, log << CONID() << "readBuffer: chk if time2play: NOW=" << now << " PKT TS=" << getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp()));
-          if ((getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp()) > now))
-              break; /* too early for this unit, return whatever was copied */
-      }
+    HLOGC(dlog.Debug, log << CONID() << "readBuffer: start=" << p << " lastack=" << lastack);
+    while ((p != lastack) && (rs > 0))
+    {
+        if (m_pUnit[p] == NULL)
+        {
+            LOGC(dlog.Error, log << CONID() << " IPE readBuffer on null packet pointer");
+            return -1;
+        }
 
-      int unitsize = (int) m_pUnit[p]->m_Packet.getLength() - m_iNotch;
-      if (unitsize > rs)
-         unitsize = rs;
+        if (m_bTsbPdMode)
+        {
+            HLOGC(dlog.Debug, log << CONID() << "readBuffer: chk if time2play:"
+                << " NOW=" << FormatTime(now)
+                << " PKT TS=" << FormatTime(getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp())));
 
-      HLOGC(dlog.Debug, log << CONID() << "readBuffer: copying buffer #" << p
-          << " targetpos=" << int(data-begin) << " sourcepos=" << m_iNotch << " size=" << unitsize << " left=" << (unitsize-rs));
-      memcpy(data, m_pUnit[p]->m_Packet.m_pcData + m_iNotch, unitsize);
-      data += unitsize;
+            if ((getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp()) > now))
+                break; /* too early for this unit, return whatever was copied */
+        }
 
-      if ((rs > unitsize) || (rs == int(m_pUnit[p]->m_Packet.getLength()) - m_iNotch))
-      {
-         CUnit* tmp = m_pUnit[p];
-         m_pUnit[p] = NULL;
-         m_pUnitQueue->makeUnitFree(tmp);
+        int unitsize = (int) m_pUnit[p]->m_Packet.getLength() - m_iNotch;
+        if (unitsize > rs)
+            unitsize = rs;
 
-         if (++ p == m_iSize)
-            p = 0;
+        HLOGC(dlog.Debug, log << CONID() << "readBuffer: copying buffer #" << p
+                << " targetpos=" << int(data-begin) << " sourcepos=" << m_iNotch << " size=" << unitsize << " left=" << (unitsize-rs));
+        memcpy(data, m_pUnit[p]->m_Packet.m_pcData + m_iNotch, unitsize);
+        data += unitsize;
 
-         m_iNotch = 0;
-      }
-      else
-         m_iNotch += rs;
+        if ((rs > unitsize) || (rs == int(m_pUnit[p]->m_Packet.getLength()) - m_iNotch))
+        {
+            freeUnitAt(p);
+            p = shiftFwd(p);
 
-      rs -= unitsize;
-   }
+            m_iNotch = 0;
+        }
+        else
+            m_iNotch += rs;
 
-   /* we removed acked bytes form receive buffer */
-   countBytes(-1, -(len - rs), true);
-   m_iStartPos = p;
+        rs -= unitsize;
+    }
 
-   return len - rs;
+    /* we removed acked bytes form receive buffer */
+    countBytes(-1, -(len - rs), true);
+    m_iStartPos = p;
+
+    return len - rs;
 }
 
 int CRcvBuffer::readBufferToFile(fstream& ofs, int len)
@@ -868,12 +860,9 @@ int CRcvBuffer::readBufferToFile(fstream& ofs, int len)
 
       if ((rs > unitsize) || (rs == int(m_pUnit[p]->m_Packet.getLength()) - m_iNotch))
       {
-         CUnit* tmp = m_pUnit[p];
-         m_pUnit[p] = NULL;
-         m_pUnitQueue->makeUnitFree(tmp);
+         freeUnitAt(p);
 
-         if (++ p == m_iSize)
-            p = 0;
+         p = shiftFwd(p);
 
          m_iNotch = 0;
       }
@@ -892,6 +881,9 @@ int CRcvBuffer::readBufferToFile(fstream& ofs, int len)
 
 void CRcvBuffer::ackData(int len)
 {
+   SRT_ASSERT(len < m_iSize);
+   SRT_ASSERT(len > 0);
+
    {
       int pkts = 0;
       int bytes = 0;
@@ -927,12 +919,13 @@ void CRcvBuffer::skipData(int len)
       m_iMaxPos = 0;
 }
 
-bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passack, ref_t<int32_t> r_skipseqno, ref_t<int32_t> r_curpktseq)
+bool CRcvBuffer::getRcvFirstMsg(steady_clock::time_point& w_tsbpdtime,
+                                bool&                     w_passack,
+                                int32_t&                  w_skipseqno,
+                                int32_t&                  w_curpktseq)
 {
-    int32_t& skipseqno = *r_skipseqno;
-    bool& passack = *r_passack;
-    skipseqno = -1;
-    passack = false;
+    w_skipseqno = -1;
+    w_passack = false;
     // tsbpdtime will be retrieved by the below call
     // Returned values:
     // - tsbpdtime: real time when the packet is ready to play (whether ready to play or not)
@@ -942,12 +935,14 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
     // - @return: whether the reported packet is ready to play
 
     /* Check the acknowledged packets */
-    if (getRcvReadyMsg(r_tsbpdtime, r_curpktseq))
+    if (getRcvReadyMsg(w_tsbpdtime, w_curpktseq))
     {
+        HLOGC(dlog.Debug, log << "getRcvFirstMsg: ready CONTIG packet: %" << w_curpktseq);
         return true;
     }
-    else if (*r_tsbpdtime != 0)
+    else if (!is_zero(w_tsbpdtime))
     {
+        HLOGC(dlog.Debug, log << "getRcvFirstMsg: no packets found");
         return false;
     }
 
@@ -964,8 +959,8 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
      * Check the not yet acked packets that may be stuck by missing packet(s).
      */
     bool haslost = false;
-    *r_tsbpdtime = 0; // redundant, for clarity
-    passack = true;
+    w_tsbpdtime = steady_clock::time_point(); // redundant, for clarity
+    w_passack = true;
 
     // XXX SUSPECTED ISSUE with this algorithm:
     // The above call to getRcvReadyMsg() should report as to whether:
@@ -994,19 +989,19 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
     // 1. Check if the VERY FIRST PACKET is valid; if so then:
     //    - check if it's ready to play, return boolean value that marks it.
 
-    for (int i = m_iLastAckPos, n = (m_iLastAckPos + m_iMaxPos) % m_iSize; i != n; i = (i + 1) % m_iSize)
+    for (int i = m_iLastAckPos, n = shift(m_iLastAckPos, m_iMaxPos); i != n; i = shiftFwd(i))
     {
-        if ( !m_pUnit[i]
-                || m_pUnit[i]->m_iFlag != CUnit::GOOD )
+        if ( !m_pUnit[i] || m_pUnit[i]->m_iFlag != CUnit::GOOD )
         {
             /* There are packets in the sequence not received yet */
             haslost = true;
+            HLOGC(dlog.Debug, log << "getRcvFirstMsg: empty hole at *" << i);
         }
         else
         {
             /* We got the 1st valid packet */
-            *r_tsbpdtime = getPktTsbPdTime(m_pUnit[i]->m_Packet.getMsgTimeStamp());
-            if (*r_tsbpdtime <= CTimer::getTime())
+            w_tsbpdtime = getPktTsbPdTime(m_pUnit[i]->m_Packet.getMsgTimeStamp());
+            if (w_tsbpdtime <= steady_clock::now())
             {
                 /* Packet ready to play */
                 if (haslost)
@@ -1015,9 +1010,12 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
                      * Packet stuck on non-acked side because of missing packets.
                      * Tell 1st valid packet seqno so caller can skip (drop) the missing packets.
                      */
-                    skipseqno = m_pUnit[i]->m_Packet.m_iSeqNo;
-                    *r_curpktseq = skipseqno;
+                    w_skipseqno = m_pUnit[i]->m_Packet.m_iSeqNo;
+                    w_curpktseq = w_skipseqno;
                 }
+
+                HLOGC(dlog.Debug, log << "getRcvFirstMsg: found ready packet, nSKIPPED: "
+                        << ((i - m_iLastAckPos + m_iSize) % m_iSize));
 
                 // NOTE: if haslost is not set, it means that this is the VERY FIRST
                 // packet, that is, packet currently at pos = m_iLastAckPos. There's no
@@ -1026,6 +1024,8 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
                 // ...
                 return true;
             }
+            HLOGC(dlog.Debug, log << "getRcvFirstMsg: found NOT READY packet, nSKIPPED: "
+                    << ((i - m_iLastAckPos + m_iSize) % m_iSize));
             // ... and if this first good packet WASN'T ready to play, THIS HERE RETURNS NOW, TOO,
             // just states that there's no ready packet to play.
             // ...
@@ -1035,115 +1035,135 @@ bool CRcvBuffer::getRcvFirstMsg(ref_t<uint64_t> r_tsbpdtime, ref_t<bool> r_passa
         // the 'haslost' is set, which means that it continues only to find the first valid
         // packet after stating that the very first packet isn't valid.
     }
+    HLOGC(dlog.Debug, log << "getRcvFirstMsg: found NO PACKETS");
     return false;
 }
 
-bool CRcvBuffer::getRcvReadyMsg(ref_t<uint64_t> tsbpdtime, ref_t<int32_t> curpktseq)
+steady_clock::time_point CRcvBuffer::debugGetDeliveryTime(int offset)
 {
-    *tsbpdtime = 0;
-    int rmpkts = 0; 
-    int rmbytes = 0;
+    int i;
+    if (offset > 0)
+        i = shift(m_iStartPos, offset);
+    else
+        i = m_iStartPos;
 
-    string reason = "NOT RECEIVED";
-    for (int i = m_iStartPos, n = m_iLastAckPos; i != n; i = (i + 1) % m_iSize)
+    CUnit* u = m_pUnit[i];
+    if (!u || u->m_iFlag != CUnit::GOOD)
+        return steady_clock::time_point();
+
+    return getPktTsbPdTime(u->m_Packet.getMsgTimeStamp());
+}
+
+bool CRcvBuffer::getRcvReadyMsg(steady_clock::time_point& w_tsbpdtime, int32_t& w_curpktseq)
+{
+    IF_HEAVY_LOGGING(const char* reason = "NOT RECEIVED");
+
+    for (int i = m_iStartPos, n = m_iLastAckPos; i != n; i = shiftFwd(i))
     {
         bool freeunit = false;
 
         /* Skip any invalid skipped/dropped packets */
         if (m_pUnit[i] == NULL)
         {
-            if (++ m_iStartPos == m_iSize)
-                m_iStartPos = 0;
+            HLOGC(mglog.Debug, log << "getRcvReadyMsg: POS=" << i
+                    << " +" << ((i - m_iStartPos + m_iSize) % m_iSize)
+                    << " SKIPPED - no unit there");
+            m_iStartPos = shiftFwd(m_iStartPos);
             continue;
         }
 
-        *curpktseq = m_pUnit[i]->m_Packet.getSeqNo();
+        w_curpktseq = m_pUnit[i]->m_Packet.getSeqNo();
 
         if (m_pUnit[i]->m_iFlag != CUnit::GOOD)
         {
+            HLOGC(mglog.Debug, log << "getRcvReadyMsg: POS=" << i
+                    << " +" << ((i - m_iStartPos + m_iSize) % m_iSize)
+                    << " SKIPPED - unit not good");
             freeunit = true;
         }
         else
         {
-            *tsbpdtime = getPktTsbPdTime(m_pUnit[i]->m_Packet.getMsgTimeStamp());
-            int64_t towait = (*tsbpdtime - CTimer::getTime());
-            if (towait > 0)
+            w_tsbpdtime = getPktTsbPdTime(m_pUnit[i]->m_Packet.getMsgTimeStamp());
+            const steady_clock::duration towait = (w_tsbpdtime - steady_clock::now());
+            if (towait.count() > 0)
             {
-                HLOGC(mglog.Debug, log << "getRcvReadyMsg: found packet, but not ready to play (only in " << (towait/1000.0) << "ms)");
+                HLOGC(mglog.Debug, log << "getRcvReadyMsg: POS=" << i
+                        << " +" << ((i - m_iStartPos + m_iSize) % m_iSize)
+                        << " pkt %" << w_curpktseq
+                        << " NOT ready to play (only in " << count_milliseconds(towait) << "ms)");
                 return false;
             }
 
             if (m_pUnit[i]->m_Packet.getMsgCryptoFlags() != EK_NOENC)
             {
-                reason = "DECRYPTION FAILED";
+                IF_HEAVY_LOGGING(reason = "DECRYPTION FAILED");
                 freeunit = true; /* packet not decrypted */
             }
             else
             {
-                HLOGC(mglog.Debug, log << "getRcvReadyMsg: packet seq=" << curpktseq.get() << " ready to play (delayed " << (-towait/1000.0) << "ms)");
+                HLOGC(mglog.Debug, log << "getRcvReadyMsg: POS=" << i
+                        << " +" << ((i - m_iStartPos + m_iSize) % m_iSize)
+                        << " pkt %" << w_curpktseq
+                        << " ready to play (delayed " << count_milliseconds(towait) << "ms)");
                 return true;
             }
         }
 
         if (freeunit)
         {
-            CUnit* tmp = m_pUnit[i];
-            m_pUnit[i] = NULL;
-            rmpkts++;
-            rmbytes += (int) tmp->m_Packet.getLength();
-            m_pUnitQueue->makeUnitFree(tmp);
+            HLOGC(mglog.Debug, log << "getRcvReadyMsg: POS=" << i << " FREED");
+            /* removed skipped, dropped, undecryptable bytes from rcv buffer */
+            const int rmbytes = (int)m_pUnit[i]->m_Packet.getLength();
+            countBytes(-1, -rmbytes, true);
 
-            if (++m_iStartPos == m_iSize)
-                m_iStartPos = 0;
+            freeUnitAt(i);
+            m_iStartPos = shiftFwd(m_iStartPos);
         }
     }
 
     HLOGC(mglog.Debug, log << "getRcvReadyMsg: nothing to deliver: " << reason);
-    /* removed skipped, dropped, undecryptable bytes from rcv buffer */
-    countBytes(-rmpkts, -rmbytes, true);
     return false;
 }
 
 
 /*
-* Return receivable data status (packet timestamp ready to play if TsbPd mode)
+* Return receivable data status (packet timestamp_us ready to play if TsbPd mode)
 * Return playtime (tsbpdtime) of 1st packet in queue, ready to play or not
 *
-* Return data ready to be received (packet timestamp ready to play if TsbPd mode)
+* Return data ready to be received (packet timestamp_us ready to play if TsbPd mode)
 * Using getRcvDataSize() to know if there is something to read as it was widely
 * used in the code (core.cpp) is expensive in TsbPD mode, hence this simpler function
 * that only check if first packet in queue is ready.
 */
-bool CRcvBuffer::isRcvDataReady(ref_t<uint64_t> tsbpdtime, ref_t<int32_t> curpktseq)
+bool CRcvBuffer::isRcvDataReady(steady_clock::time_point& w_tsbpdtime, int32_t& w_curpktseq)
 {
-   *tsbpdtime = 0;
+    w_tsbpdtime = steady_clock::time_point();
 
-   if (m_bTsbPdMode)
-   {
-       CPacket* pkt = getRcvReadyPacket();
-       if ( pkt )
-       {
-            /* 
-            * Acknowledged data is available,
-            * Only say ready if time to deliver.
-            * Report the timestamp, ready or not.
-            */
-            *curpktseq = pkt->getSeqNo();
-            *tsbpdtime = getPktTsbPdTime(pkt->getMsgTimeStamp());
-            if (*tsbpdtime <= CTimer::getTime())
-               return true;
-       }
-       return false;
-   }
+    if (m_bTsbPdMode)
+    {
+        CPacket* pkt = getRcvReadyPacket();
+        if (!pkt)
+            return false;
+    
+        /* 
+        * Acknowledged data is available,
+        * Only say ready if time to deliver.
+        * Report the timestamp_us, ready or not.
+        */
+        w_curpktseq = pkt->getSeqNo();
+        w_tsbpdtime = getPktTsbPdTime(pkt->getMsgTimeStamp());
+    
+        return w_tsbpdtime <= steady_clock::now();
+    }
 
-   return isRcvDataAvailable();
+    return isRcvDataAvailable();
 }
 
 // XXX This function may be called only after checking
 // if m_bTsbPdMode.
 CPacket* CRcvBuffer::getRcvReadyPacket()
 {
-    for (int i = m_iStartPos, n = m_iLastAckPos; i != n; i = (i + 1) % m_iSize)
+    for (int i = m_iStartPos, n = m_iLastAckPos; i != n; i = shiftFwd(i))
     {
         /* 
          * Skip missing packets that did not arrive in time.
@@ -1155,12 +1175,71 @@ CPacket* CRcvBuffer::getRcvReadyPacket()
     return 0;
 }
 
+#if ENABLE_HEAVY_LOGGING
+// This function is for debug purposes only and it's called only
+// from within HLOG* macros.
+void CRcvBuffer::reportBufferStats() const
+{
+    int nmissing = 0;
+    int32_t low_seq= -1, high_seq = -1;
+    int32_t low_ts = 0, high_ts = 0;
+
+    for (int i = m_iStartPos, n = m_iLastAckPos; i != n; i = (i + 1) % m_iSize)
+    {
+        if ( m_pUnit[i] && m_pUnit[i]->m_iFlag == CUnit::GOOD )
+        {
+            low_seq = m_pUnit[i]->m_Packet.m_iSeqNo;
+            low_ts = m_pUnit[i]->m_Packet.m_iTimeStamp;
+            break;
+        }
+        ++nmissing;
+    }
+
+    // Not sure if a packet MUST BE at the last ack pos position, so check, just in case.
+    int n = m_iLastAckPos;
+    if (m_pUnit[n] && m_pUnit[n]->m_iFlag == CUnit::GOOD)
+    {
+        high_ts = m_pUnit[n]->m_Packet.m_iTimeStamp;
+        high_seq = m_pUnit[n]->m_Packet.m_iSeqNo;
+    }
+    else
+    {
+        // Possibilities are:
+        // m_iStartPos == m_iLastAckPos, high_ts == low_ts, defined.
+        // No packet: low_ts == 0, so high_ts == 0, too.
+        high_ts = low_ts;
+    }
+    // The 32-bit timestamps are relative and roll over oftten; what
+    // we really need is the timestamp difference. The only place where
+    // we can ask for the time base is the upper time because when trying
+    // to receive the time base for the lower time we'd break the requirement
+    // for monotonic clock.
+
+    uint64_t upper_time = high_ts;
+    uint64_t lower_time = low_ts;
+
+    if (lower_time > upper_time)
+        upper_time += uint64_t(CPacket::MAX_TIMESTAMP)+1;
+
+    int32_t timespan = upper_time - lower_time;
+    int seqspan = 0;
+    if (low_seq != -1 && high_seq != -1)
+    {
+        seqspan = CSeqNo::seqoff(low_seq, high_seq);
+    }
+
+    LOGC(dlog.Debug, log << "RCV BUF STATS: seqspan=%(" << low_seq << "-" << high_seq << ":" << seqspan << ") missing=" << nmissing << "pkts");
+    LOGC(dlog.Debug, log << "RCV BUF STATS: timespan=" << timespan << "us (lo=" << lower_time << " hi=" << upper_time << ")");
+}
+
+#endif // ENABLE_HEAVY_LOGGING
+
 bool CRcvBuffer::isRcvDataReady()
 {
-   uint64_t tsbpdtime;
+   steady_clock::time_point tsbpdtime;
    int32_t seq;
 
-   return isRcvDataReady(Ref(tsbpdtime), Ref(seq));
+   return isRcvDataReady((tsbpdtime), (seq));
 }
 
 int CRcvBuffer::getAvailBufSize() const
@@ -1192,22 +1271,13 @@ int CRcvBuffer::debugGetSize() const
     return size;
 }
 
-
-bool CRcvBuffer::empty() const
-{
-    // This will not always return the intended value,
-    // that is, it may return false when the buffer really is
-    // empty - but it will return true then in one of next calls.
-    // This function will be always called again at some point
-    // if it returned false, and on true the connection
-    // is going to be broken - so this behavior is acceptable.
-    return m_iStartPos == m_iLastAckPos;
-}
-
-
 #ifdef SRT_ENABLE_RCVBUFSZ_MAVG
+
+#define SRT_MAVG_BASE_PERIOD 1000000 // us
+#define SRT_us2ms 1000
+
 /* Return moving average of acked data pkts, bytes, and timespan (ms) of the receive buffer */
-int CRcvBuffer::getRcvAvgDataSize(int &bytes, int &timespan)
+int CRcvBuffer::getRcvAvgDataSize(int& bytes, int& timespan)
 {
    timespan = m_TimespanMAvg;
    bytes = m_iBytesCountMAvg;
@@ -1215,23 +1285,23 @@ int CRcvBuffer::getRcvAvgDataSize(int &bytes, int &timespan)
 }
 
 /* Update moving average of acked data pkts, bytes, and timespan (ms) of the receive buffer */
-void CRcvBuffer::updRcvAvgDataSize(uint64_t now)
+void CRcvBuffer::updRcvAvgDataSize(const steady_clock::time_point& now)
 {
-   uint64_t elapsed = (now - m_LastSamplingTime) / 1000; //ms since last sampling
+   const uint64_t elapsed_ms = count_milliseconds(now - m_tsLastSamplingTime); //ms since last sampling
 
-   if ((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 > elapsed)
+   if (elapsed_ms < (SRT_MAVG_BASE_PERIOD / SRT_MAVG_SAMPLING_RATE) / SRT_us2ms)
       return; /* Last sampling too recent, skip */
 
-   if (1000000 < elapsed)
+   if (elapsed_ms > SRT_MAVG_BASE_PERIOD / SRT_us2ms)
    {
       /* No sampling in last 1 sec, initialize/reset moving average */
       m_iCountMAvg = getRcvDataSize(m_iBytesCountMAvg, m_TimespanMAvg);
-      m_LastSamplingTime = now;
+      m_tsLastSamplingTime = now;
 
       HLOGC(dlog.Debug, log << "getRcvDataSize: " << m_iCountMAvg << " " << m_iBytesCountMAvg
-              << " " << m_TimespanMAvg << " ms elapsed: " << elapsed << " ms");
+              << " " << m_TimespanMAvg << " ms elapsed: " << elapsed_ms << " ms");
    }
-   else if ((1000000 / SRT_MAVG_SAMPLING_RATE) / 1000 <= elapsed)
+   else if (elapsed_ms >= (SRT_MAVG_BASE_PERIOD / SRT_MAVG_SAMPLING_RATE) / SRT_us2ms)
    {
       /*
       * Weight last average value between -1 sec and last sampling time (LST)
@@ -1244,34 +1314,33 @@ void CRcvBuffer::updRcvAvgDataSize(uint64_t now)
       int bytescount;
       int count = getRcvDataSize(bytescount, instspan);
 
-      m_iCountMAvg      = (int)(((count      * (1000 - elapsed)) + (count      * elapsed)) / 1000);
-      m_iBytesCountMAvg = (int)(((bytescount * (1000 - elapsed)) + (bytescount * elapsed)) / 1000);
-      m_TimespanMAvg    = (int)(((instspan   * (1000 - elapsed)) + (instspan   * elapsed)) / 1000);
-      m_LastSamplingTime = now;
+      m_iCountMAvg      = (int)(((count      * (1000 - elapsed_ms)) + (count      * elapsed_ms)) / 1000);
+      m_iBytesCountMAvg = (int)(((bytescount * (1000 - elapsed_ms)) + (bytescount * elapsed_ms)) / 1000);
+      m_TimespanMAvg    = (int)(((instspan   * (1000 - elapsed_ms)) + (instspan   * elapsed_ms)) / 1000);
+      m_tsLastSamplingTime = now;
 
       HLOGC(dlog.Debug, log << "getRcvDataSize: " << count << " " << bytescount << " " << instspan
-              << " ms elapsed: " << elapsed << " ms");
+              << " ms elapsed_ms: " << elapsed_ms << " ms");
    }
 }
 #endif /* SRT_ENABLE_RCVBUFSZ_MAVG */
 
 /* Return acked data pkts, bytes, and timespan (ms) of the receive buffer */
-int CRcvBuffer::getRcvDataSize(int &bytes, int &timespan)
+int CRcvBuffer::getRcvDataSize(int& bytes, int& timespan)
 {
    timespan = 0;
    if (m_bTsbPdMode)
    {
-      /* skip invalid entries */
-      int i,n;
-      for (i = m_iStartPos, n = m_iLastAckPos; i != n; i = (i + 1) % m_iSize)
+      // Get a valid startpos.
+      // Skip invalid entries in the beginning, if any.
+      int startpos = m_iStartPos;
+      for (; startpos != m_iLastAckPos; startpos = shiftFwd(startpos))
       {
-         if ((NULL != m_pUnit[i]) && (CUnit::GOOD == m_pUnit[i]->m_iFlag))
+         if ((NULL != m_pUnit[startpos]) && (CUnit::GOOD == m_pUnit[startpos]->m_iFlag))
              break;
       }
 
-      /* Get a valid startpos */
-      int startpos = i;
-      int endpos = n;
+      int endpos = m_iLastAckPos;
 
       if (m_iLastAckPos != startpos) 
       {
@@ -1297,8 +1366,8 @@ int CRcvBuffer::getRcvDataSize(int &bytes, int &timespan)
 
          if ((NULL != m_pUnit[endpos]) && (NULL != m_pUnit[startpos]))
          {
-            uint64_t startstamp = getPktTsbPdTime(m_pUnit[startpos]->m_Packet.getMsgTimeStamp());
-            uint64_t endstamp = getPktTsbPdTime(m_pUnit[endpos]->m_Packet.getMsgTimeStamp());
+            const steady_clock::time_point startstamp = getPktTsbPdTime(m_pUnit[startpos]->m_Packet.getMsgTimeStamp());
+            const steady_clock::time_point endstamp   = getPktTsbPdTime(m_pUnit[endpos]->m_Packet.getMsgTimeStamp());
             /* 
             * There are sampling conditions where spantime is < 0 (big unsigned value).
             * It has been observed after changing the SRT latency from 450 to 200 on the sender.
@@ -1315,7 +1384,7 @@ int CRcvBuffer::getRcvDataSize(int &bytes, int &timespan)
             * 2014-12-08T15:04:50-0500     4475      124        0  100543  53.526        505     200
             */
             if (endstamp > startstamp)
-                timespan = (int)((endstamp - startstamp) / 1000);
+                timespan = count_milliseconds(endstamp - startstamp);
          }
          /* 
          * Timespan can be less then 1000 us (1 ms) if few packets. 
@@ -1338,75 +1407,76 @@ int CRcvBuffer::getRcvAvgPayloadSize() const
 
 void CRcvBuffer::dropMsg(int32_t msgno, bool using_rexmit_flag)
 {
-   for (int i = m_iStartPos, n = (m_iLastAckPos + m_iMaxPos) % m_iSize; i != n; i = (i + 1) % m_iSize)
+   for (int i = m_iStartPos, n = shift(m_iLastAckPos, m_iMaxPos); i != n; i = shiftFwd(i))
       if ((m_pUnit[i] != NULL) 
               && (m_pUnit[i]->m_Packet.getMsgSeq(using_rexmit_flag) == msgno))
          m_pUnit[i]->m_iFlag = CUnit::DROPPED;
 }
 
-uint64_t CRcvBuffer::getTsbPdTimeBase(uint32_t timestamp)
+steady_clock::time_point CRcvBuffer::getTsbPdTimeBase(uint32_t timestamp_us)
 {
-   /* 
-   * Packet timestamps wrap around every 01h11m35s (32-bit in usec)
-   * When added to the peer start time (base time), 
-   * wrapped around timestamps don't provide a valid local packet delevery time.
-   *
-   * A wrap check period starts 30 seconds before the wrap point.
-   * In this period, timestamps smaller than 30 seconds are considered to have wrapped around (then adjusted).
-   * The wrap check period ends 30 seconds after the wrap point, afterwhich time base has been adjusted.
-   */ 
-   uint64_t carryover = 0;
+    /*
+    * Packet timestamps wrap around every 01h11m35s (32-bit in usec)
+    * When added to the peer start time (base time),
+    * wrapped around timestamps don't provide a valid local packet delevery time.
+    *
+    * A wrap check period starts 30 seconds before the wrap point.
+    * In this period, timestamps smaller than 30 seconds are considered to have wrapped around (then adjusted).
+    * The wrap check period ends 30 seconds after the wrap point, afterwhich time base has been adjusted.
+    */
+    int64_t carryover = 0;
 
-   // This function should generally return the timebase for the given timestamp.
-   // It's assumed that the timestamp, for which this function is being called,
-   // is received as monotonic clock. This function then traces the changes in the
-   // timestamps passed as argument and catches the moment when the 64-bit timebase
-   // should be increased by a "segment length" (MAX_TIMESTAMP+1).
+    // This function should generally return the timebase for the given timestamp_us.
+    // It's assumed that the timestamp_us, for which this function is being called,
+    // is received as monotonic clock. This function then traces the changes in the
+    // timestamps passed as argument and catches the moment when the 64-bit timebase
+    // should be increased by a "segment length" (MAX_TIMESTAMP+1).
 
-   // The checks will be provided for the following split:
-   // [INITIAL30][FOLLOWING30]....[LAST30] <-- == CPacket::MAX_TIMESTAMP
-   //
-   // The following actions should be taken:
-   // 1. Check if this is [LAST30]. If so, ENTER TSBPD-wrap-check state
-   // 2. Then, it should turn into [INITIAL30] at some point. If so, use carryover MAX+1.
-   // 3. Then it should switch to [FOLLOWING30]. If this is detected,
-   //    - EXIT TSBPD-wrap-check state
-   //    - save the carryover as the current time base.
+    // The checks will be provided for the following split:
+    // [INITIAL30][FOLLOWING30]....[LAST30] <-- == CPacket::MAX_TIMESTAMP
+    //
+    // The following actions should be taken:
+    // 1. Check if this is [LAST30]. If so, ENTER TSBPD-wrap-check state
+    // 2. Then, it should turn into [INITIAL30] at some point. If so, use carryover MAX+1.
+    // 3. Then it should switch to [FOLLOWING30]. If this is detected,
+    //    - EXIT TSBPD-wrap-check state
+    //    - save the carryover as the current time base.
 
-   if (m_bTsbPdWrapCheck) 
-   {
-       // Wrap check period.
+    if (m_bTsbPdWrapCheck)
+    {
+        // Wrap check period.
 
-       if (timestamp < TSBPD_WRAP_PERIOD)
-       {
-           carryover = uint64_t(CPacket::MAX_TIMESTAMP) + 1;
-       }
-       // 
-       else if ((timestamp >= TSBPD_WRAP_PERIOD)
-               &&  (timestamp <= (TSBPD_WRAP_PERIOD * 2)))
-       {
-           /* Exiting wrap check period (if for packet delivery head) */
-           m_bTsbPdWrapCheck = false;
-           m_ullTsbPdTimeBase += uint64_t(CPacket::MAX_TIMESTAMP) + 1;
-           tslog.Debug("tsppd wrap period ends");
-       }
-   }
-   // Check if timestamp is in the last 30 seconds before reaching the MAX_TIMESTAMP.
-   else if (timestamp > (CPacket::MAX_TIMESTAMP - TSBPD_WRAP_PERIOD))
-   {
-      /* Approching wrap around point, start wrap check period (if for packet delivery head) */
-      m_bTsbPdWrapCheck = true;
-      tslog.Debug("tsppd wrap period begins");
-   }
-   return(m_ullTsbPdTimeBase + carryover);
+        if (timestamp_us < TSBPD_WRAP_PERIOD)
+        {
+            carryover = int64_t(CPacket::MAX_TIMESTAMP) + 1;
+        }
+        //
+        else if ((timestamp_us >= TSBPD_WRAP_PERIOD)
+            && (timestamp_us <= (TSBPD_WRAP_PERIOD * 2)))
+        {
+            /* Exiting wrap check period (if for packet delivery head) */
+            m_bTsbPdWrapCheck = false;
+            m_tsTsbPdTimeBase += microseconds_from(int64_t(CPacket::MAX_TIMESTAMP) + 1);
+            tslog.Debug("tsbpd wrap period ends");
+        }
+    }
+    // Check if timestamp_us is in the last 30 seconds before reaching the MAX_TIMESTAMP.
+    else if (timestamp_us > (CPacket::MAX_TIMESTAMP - TSBPD_WRAP_PERIOD))
+    {
+        /* Approching wrap around point, start wrap check period (if for packet delivery head) */
+        m_bTsbPdWrapCheck = true;
+        tslog.Debug("tsbpd wrap period begins");
+    }
+
+    return (m_tsTsbPdTimeBase + microseconds_from(carryover));
 }
 
-uint64_t CRcvBuffer::getPktTsbPdTime(uint32_t timestamp)
+steady_clock::time_point CRcvBuffer::getPktTsbPdTime(uint32_t timestamp)
 {
-   return(getTsbPdTimeBase(timestamp) + m_uTsbPdDelay + timestamp + m_DriftTracer.drift());
+   return(getTsbPdTimeBase(timestamp) + m_tdTsbPdDelay + microseconds_from(timestamp + m_DriftTracer.drift()));
 }
 
-int CRcvBuffer::setRcvTsbPdMode(uint64_t timebase, uint32_t delay)
+int CRcvBuffer::setRcvTsbPdMode(const steady_clock::time_point& timebase, const steady_clock::duration& delay)
 {
     m_bTsbPdMode = true;
     m_bTsbPdWrapCheck = false;
@@ -1416,14 +1486,14 @@ int CRcvBuffer::setRcvTsbPdMode(uint64_t timebase, uint32_t delay)
     // where ctrlpkt is the packet with SRT_CMD_HSREQ message.
     //
     // This function is called in the HSREQ reception handler only.
-    m_ullTsbPdTimeBase = timebase;
+    m_tsTsbPdTimeBase = timebase;
     // XXX Seems like this may not work correctly.
     // At least this solution this way won't work with application-supplied
     // timestamps. For that case the timestamps should be taken exclusively
     // from the data packets because in case of application-supplied timestamps
     // they come from completely different server and undergo different rules
     // of network latency and drift.
-    m_uTsbPdDelay = delay;
+    m_tdTsbPdDelay = delay;
     return 0;
 }
 
@@ -1486,7 +1556,7 @@ void CRcvBuffer::printDriftOffset(int tsbPdOffset, int tsbPdDriftAvg)
 }
 #endif /* SRT_DEBUG_TSBPD_DRIFT */
 
-void CRcvBuffer::addRcvTsbPdDriftSample(uint32_t timestamp, pthread_mutex_t& mutex_to_lock)
+void CRcvBuffer::addRcvTsbPdDriftSample(uint32_t timestamp_us, pthread_mutex_t& mutex_to_lock)
 {
     if (!m_bTsbPdMode) // Not checked unless in TSBPD mode
         return;
@@ -1494,7 +1564,7 @@ void CRcvBuffer::addRcvTsbPdDriftSample(uint32_t timestamp, pthread_mutex_t& mut
      * TsbPD time drift correction
      * TsbPD time slowly drift over long period depleting decoder buffer or raising latency
      * Re-evaluate the time adjustment value using a receiver control packet (ACK-ACK).
-     * ACK-ACK timestamp is RTT/2 ago (in sender's time base)
+     * ACK-ACK timestamp_us is RTT/2 ago (in sender's time base)
      * Data packet have origin time stamp which is older when retransmitted so not suitable for this.
      *
      * Every TSBPD_DRIFT_MAX_SAMPLES packets, the average drift is calculated
@@ -1504,15 +1574,15 @@ void CRcvBuffer::addRcvTsbPdDriftSample(uint32_t timestamp, pthread_mutex_t& mut
      */
 
     // Note important thing: this function is being called _EXCLUSIVELY_ in the handler
-    // of UMSG_ACKACK command reception. This means that the timestamp used here comes
+    // of UMSG_ACKACK command reception. This means that the timestamp_us used here comes
     // from the CONTROL domain, not DATA domain (timestamps from DATA domain may be
     // either schedule time or a time supplied by the application).
 
-    int64_t iDrift = CTimer::getTime() - (getTsbPdTimeBase(timestamp) + timestamp);
+    const steady_clock::duration iDrift = steady_clock::now() - (getTsbPdTimeBase(timestamp_us) + microseconds_from(timestamp_us));
 
     CGuard::enterCS(mutex_to_lock);
 
-    bool updated = m_DriftTracer.update(iDrift);
+    bool updated = m_DriftTracer.update(count_microseconds(iDrift));
 
 #ifdef SRT_DEBUG_TSBPD_DRIFT
     printDriftHistogram(iDrift);
@@ -1524,7 +1594,18 @@ void CRcvBuffer::addRcvTsbPdDriftSample(uint32_t timestamp, pthread_mutex_t& mut
         printDriftOffset(m_DriftTracer.overdrift(), m_DriftTracer.drift());
 #endif /* SRT_DEBUG_TSBPD_DRIFT */
 
-        m_ullTsbPdTimeBase += m_DriftTracer.overdrift();
+#if ENABLE_HEAVY_LOGGING
+        const steady_clock::time_point oldbase = m_tsTsbPdTimeBase;
+#endif
+        m_tsTsbPdTimeBase += microseconds_from(m_DriftTracer.overdrift());
+
+        HLOGC(dlog.Debug, log << "DRIFT=" << count_milliseconds(iDrift) << "ms AVG="
+                << (m_DriftTracer.drift()/1000.0) << "ms, TB: "
+                << FormatTime(oldbase) << " UPDATED TO: " << FormatTime(m_tsTsbPdTimeBase));
+    }
+    else
+    {
+        HLOGC(dlog.Debug, log << "DRIFT=" << count_milliseconds(iDrift) << "ms TB REMAINS: " << FormatTime(m_tsTsbPdTimeBase));
     }
 
     CGuard::leaveCS(mutex_to_lock);
@@ -1537,6 +1618,21 @@ int CRcvBuffer::readMsg(char* data, int len)
 }
 
 
+#ifdef SRT_DEBUG_TSBPD_OUTJITTER
+void CRcvBuffer::debugTraceJitter(uint64_t rplaytime)
+{
+    uint64_t now = CTimer::getTime();
+    if ((now - rplaytime)/10 < 10)
+        m_ulPdHisto[0][(now - rplaytime)/10]++;
+    else if ((now - rplaytime)/100 < 10)
+        m_ulPdHisto[1][(now - rplaytime)/100]++;
+    else if ((now - rplaytime)/1000 < 10)
+        m_ulPdHisto[2][(now - rplaytime)/1000]++;
+    else
+        m_ulPdHisto[3][1]++;
+}
+#endif   /* SRT_DEBUG_TSBPD_OUTJITTER */
+
 int CRcvBuffer::readMsg(char* data, int len, ref_t<SRT_MSGCTRL> r_msgctl)
 {
     SRT_MSGCTRL& msgctl = *r_msgctl;
@@ -1545,31 +1641,28 @@ int CRcvBuffer::readMsg(char* data, int len, ref_t<SRT_MSGCTRL> r_msgctl)
     bool empty = true;
     uint64_t& rplaytime = msgctl.srctime;
 
+#ifdef ENABLE_HEAVY_LOGGING
+    reportBufferStats();
+#endif
+
     if (m_bTsbPdMode)
     {
         passack = false;
         int seq = 0;
 
-        if (getRcvReadyMsg(Ref(rplaytime), Ref(seq)))
+        steady_clock::time_point play_time;
+        const bool isReady = getRcvReadyMsg(play_time, (seq));
+        rplaytime = count_microseconds(play_time.time_since_epoch());
+
+        if (isReady)
         {
             empty = false;
-
             // In TSBPD mode you always read one message
             // at a time and a message always fits in one UDP packet,
             // so in one "unit".
             p = q = m_iStartPos;
 
-#ifdef SRT_DEBUG_TSBPD_OUTJITTER
-            uint64_t now = CTimer::getTime();
-            if ((now - rplaytime)/10 < 10)
-                m_ulPdHisto[0][(now - rplaytime)/10]++;
-            else if ((now - rplaytime)/100 < 10)
-                m_ulPdHisto[1][(now - rplaytime)/100]++;
-            else if ((now - rplaytime)/1000 < 10)
-                m_ulPdHisto[2][(now - rplaytime)/1000]++;
-            else
-                m_ulPdHisto[3][1]++;
-#endif   /* SRT_DEBUG_TSBPD_OUTJITTER */
+            debugTraceJitter(rplaytime);
         }
     }
     else
@@ -1592,65 +1685,97 @@ int CRcvBuffer::readMsg(char* data, int len, ref_t<SRT_MSGCTRL> r_msgctl)
     msgctl.pktseq = pkt1.getSeqNo();
     msgctl.msgno = pkt1.getMsgSeq();
 
-    int rs = len;
-    while (p != (q + 1) % m_iSize)
+    SRT_ASSERT(len > 0);
+    int rs = len > 0 ? len : 0;
+    const int past_q = shiftFwd(q);
+    while (p != past_q)
     {
-        int unitsize = (int) m_pUnit[p]->m_Packet.getLength();
-        if ((rs >= 0) && (unitsize > rs))
-            unitsize = rs;
+        const int pktlen = (int)m_pUnit[p]->m_Packet.getLength();
+        // When unitsize is less than pktlen, only a fragment is copied to the output 'data',
+        // but still the whole packet is removed from the receiver buffer.
+        if (pktlen > 0)
+            countBytes(-1, -pktlen, true);
+
+        const int unitsize = ((rs >= 0) && (pktlen > rs)) ? rs : pktlen;
+
+        HLOGC(mglog.Debug, log << "readMsg: checking unit POS=" << p);
 
         if (unitsize > 0)
         {
             memcpy(data, m_pUnit[p]->m_Packet.m_pcData, unitsize);
             data += unitsize;
             rs -= unitsize;
-            /* we removed bytes form receive buffer */
-            countBytes(-1, -unitsize, true);
-
-
-#if ENABLE_HEAVY_LOGGING
-            {
-                static uint64_t prev_now;
-                static uint64_t prev_srctime;
-
-                int32_t seq = m_pUnit[p]->m_Packet.m_iSeqNo;
-
-                uint64_t nowtime = CTimer::getTime();
-                //CTimer::rdtsc(nowtime);
-                uint64_t srctime = getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp());
-
-                int64_t timediff = nowtime - srctime;
-                int64_t nowdiff = prev_now ? (nowtime - prev_now) : 0;
-                uint64_t srctimediff = prev_srctime ? (srctime - prev_srctime) : 0;
-
-                HLOGC(dlog.Debug, log << CONID() << "readMsg: DELIVERED seq=" << seq << " T=" << FormatTime(srctime) << " in " << (timediff/1000.0) << "ms - "
-                    "TIME-PREVIOUS: PKT: " << (srctimediff/1000.0) << " LOCAL: " << (nowdiff/1000.0));
-
-                prev_now = nowtime;
-                prev_srctime = srctime;
-            }
-#endif
-        }
-
-        if (!passack)
-        {
-            CUnit* tmp = m_pUnit[p];
-            m_pUnit[p] = NULL;
-            m_pUnitQueue->makeUnitFree(tmp);
+            IF_HEAVY_LOGGING(readMsgHeavyLogging(p));
         }
         else
-            m_pUnit[p]->m_iFlag = CUnit::PASSACK;
+        {
+            HLOGC(dlog.Debug, log << CONID() << "readMsg: SKIPPED POS=" << p << " - ZERO SIZE UNIT");
+        }
 
-        if (++ p == m_iSize)
-            p = 0;
+        // Note special case for live mode (one packet per message and TSBPD=on):
+        //  - p == q (that is, this loop passes only once)
+        //  - no passack (the unit is always removed from the buffer)
+        if (!passack)
+        {
+            HLOGC(dlog.Debug, log << CONID() << "readMsg: FREEING UNIT POS=" << p);
+            freeUnitAt(p);
+        }
+        else
+        {
+            HLOGC(dlog.Debug, log << CONID() << "readMsg: PASSACK UNIT POS=" << p);
+            m_pUnit[p]->m_iFlag = CUnit::PASSACK;
+        }
+
+        p = shiftFwd(p);
     }
 
     if (!passack)
-        m_iStartPos = (q + 1) % m_iSize;
+        m_iStartPos = past_q;
+
+    HLOGC(dlog.Debug, log << "rcvBuf/extractData: begin=" << m_iStartPos << " reporting extraction size=" << (len - rs));
 
     return len - rs;
 }
 
+#if ENABLE_HEAVY_LOGGING
+void CRcvBuffer::readMsgHeavyLogging(int p)
+{
+    static steady_clock::time_point prev_now;
+    static steady_clock::time_point prev_srctime;
+    CPacket& pkt = m_pUnit[p]->m_Packet;
+
+    int32_t seq = pkt.m_iSeqNo;
+
+    steady_clock::time_point nowtime = steady_clock::now();
+    steady_clock::time_point srctime = getPktTsbPdTime(m_pUnit[p]->m_Packet.getMsgTimeStamp());
+
+    const int64_t timediff_ms = count_milliseconds(nowtime - srctime);
+    const int64_t nowdiff_ms = is_zero(prev_now) ? count_milliseconds(nowtime - prev_now) : 0;
+    const int64_t srctimediff_ms = is_zero(prev_srctime) ? count_milliseconds(srctime - prev_srctime) : 0;
+
+    const int next_p = shiftFwd(p);
+    CUnit* u = m_pUnit[next_p];
+    string next_playtime;
+    if (u && u->m_iFlag == CUnit::GOOD)
+    {
+        next_playtime = FormatTime(getPktTsbPdTime(u->m_Packet.getMsgTimeStamp()));
+    }
+    else
+    {
+        next_playtime = "NONE";
+    }
+
+    LOGC(dlog.Debug, log << CONID() << "readMsg: DELIVERED seq=" << seq
+            << " T=" << FormatTime(srctime)
+            << " in " << timediff_ms << "ms - TIME-PREVIOUS: PKT: "
+            << srctimediff_ms << " LOCAL: " << nowdiff_ms
+            << " !" << BufferStamp(pkt.data(), pkt.size())
+            << " NEXT pkt T=" << next_playtime);
+
+    prev_now = nowtime;
+    prev_srctime = srctime;
+}
+#endif
 
 bool CRcvBuffer::scanMsg(ref_t<int> r_p, ref_t<int> r_q, ref_t<bool> passack)
 {
@@ -1667,6 +1792,8 @@ bool CRcvBuffer::scanMsg(ref_t<int> r_p, ref_t<int> r_q, ref_t<bool> passack)
     int rmpkts = 0;
     int rmbytes = 0;
     //skip all bad msgs at the beginning
+    // This loop rolls until the "buffer is empty" (head == tail),
+    // in particular, there's no unit accessible for the reader.
     while (m_iStartPos != m_iLastAckPos)
     {
         // Roll up to the first valid unit
@@ -1718,14 +1845,10 @@ bool CRcvBuffer::scanMsg(ref_t<int> r_p, ref_t<int> r_q, ref_t<bool> passack)
                 break;
         }
 
-        CUnit* tmp = m_pUnit[m_iStartPos];
-        m_pUnit[m_iStartPos] = NULL;
         rmpkts++;
-        rmbytes += (int) tmp->m_Packet.getLength();
-        m_pUnitQueue->makeUnitFree(tmp);
+        rmbytes += freeUnitAt(m_iStartPos);
 
-        if (++ m_iStartPos == m_iSize)
-            m_iStartPos = 0;
+        m_iStartPos = shiftFwd(m_iStartPos);
     }
     /* we removed bytes form receive buffer */
     countBytes(-rmpkts, -rmbytes, true);
@@ -1751,11 +1874,27 @@ bool CRcvBuffer::scanMsg(ref_t<int> r_p, ref_t<int> r_q, ref_t<bool> passack)
     // actually from the first message up to the one with PB_LAST
     // or PB_SOLO boundary.
 
-    // The 'i' variable used in this loop is just a stub, and the
-    // upper value is just to make it "virtually infinite, but with
-    // no exaggeration" (actually it makes sure that this loop does
-    // not roll more than around the whole cyclic container). This variable
-    // isn't used inside the loop at all.
+    // The 'i' variable used in this loop is just a stub and it's
+    // even hard to define the unit here. It is "shift towards
+    // m_iStartPos", so the upper value is m_iMaxPos + size.
+    // m_iMaxPos is itself relative to m_iLastAckPos, so
+    // the upper value is m_iMaxPos + difference between
+    // m_iLastAckPos and m_iStartPos, so that this value is relative
+    // to m_iStartPos.
+    //
+    // The 'i' value isn't used anywhere, although the 'q' value rolls
+    // in this loop in sync with 'i', with the difference that 'q' is
+    // wrapped around, and 'i' is just incremented normally.
+    //
+    // This makes that this loop rolls in the range by 'q' from
+    // m_iStartPos to m_iStartPos + UPPER,
+    // where UPPER = m_iLastAckPos -% m_iStartPos + m_iMaxPos
+    // This embraces the range from the current reading head up to
+    // the last packet ever received.
+    //
+    // 'passack' is set to true when the 'q' has passed through
+    // the border of m_iLastAckPos and fallen into the range
+    // of unacknowledged packets.
 
     for (int i = 0, n = m_iMaxPos + getRcvDataSize(); i < n; ++ i)
     {
@@ -1828,7 +1967,7 @@ bool CRcvBuffer::scanMsg(ref_t<int> r_p, ref_t<int> r_q, ref_t<bool> passack)
         // - Found no terminal packet (PB_LAST) for that message.
 
         // if the message is larger than the receiver buffer, return part of the message
-        if ((p != -1) && ((q + 1) % m_iSize == p))
+        if ((p != -1) && (shiftFwd(q) == p))
         {
             HLOGC(mglog.Debug, log << "scanMsg: BUFFER FULL and message is INCOMPLETE. Returning PARTIAL MESSAGE.");
             found = true;
