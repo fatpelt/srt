@@ -28,16 +28,13 @@ written by
 #else
 #include <sys/time.h>
 #endif
-#include <pthread.h>
-#if HAVE_CXX11
-#include <mutex>
-#endif
 
 #include "srt.h"
 #include "utilities.h"
 #include "threadname.h"
 #include "logging_api.h"
 #include "srt_compat.h"
+#include "sync.h"
 
 #ifdef __GNUC__
 #define PRINTF_LIKE __attribute__((format(printf,2,3)))
@@ -70,11 +67,15 @@ written by
 #define HLOGP LOGP
 #define HLOGF LOGF
 
+#define IF_HEAVY_LOGGING(instr) instr
+
 #else
 
 #define HLOGC(...)
 #define HLOGF(...)
 #define HLOGP(...)
+
+#define IF_HEAVY_LOGGING(instr) (void)0
 
 #endif
 
@@ -87,6 +88,8 @@ written by
 #define HLOGC(...)
 #define HLOGF(...)
 #define HLOGP(...)
+
+#define IF_HEAVY_LOGGING(instr) (void)0
 
 #endif
 
@@ -104,17 +107,17 @@ struct LogConfig
     pthread_mutex_t mutex;
     int flags;
 
-    LogConfig(const fa_bitset_t& initial_fa):
-        enabled_fa(initial_fa),
-        max_level(LogLevel::warning),
-        log_stream(&std::cerr)
+    LogConfig(const fa_bitset_t& efa,
+            LogLevel::type l = LogLevel::warning,
+            std::ostream* ls = &std::cerr)
+        : enabled_fa(efa)
+        , max_level(l)
+        , log_stream(ls)
+        , loghandler_fn()
+        , loghandler_opaque()
+        , flags()
     {
-        pthread_mutex_init(&mutex, 0);
-    }
-    LogConfig(const fa_bitset_t& efa, LogLevel::type l, std::ostream* ls):
-        enabled_fa(efa), max_level(l), log_stream(ls)
-    {
-        pthread_mutex_init(&mutex, 0);
+        pthread_mutex_init(&mutex, NULL);
     }
 
     ~LogConfig()
@@ -286,7 +289,7 @@ struct LogDispatcher::Proxy
     // or better __func__.
     std::string ExtractName(std::string pretty_function);
 
-	Proxy(LogDispatcher& guy);
+    Proxy(LogDispatcher& guy);
 
     // Copy constructor is needed due to noncopyable ostringstream.
     // This is used only in creation of the default object, so just
@@ -401,7 +404,6 @@ inline bool LogDispatcher::CheckEnabled()
     return configured_enabled_fa && level <= configured_maxlevel;
 }
 
-SRT_API std::string FormatTime(uint64_t time);
 
 #if HAVE_CXX11
 

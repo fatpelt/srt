@@ -9,6 +9,7 @@
  */
 
 #include "socketoptions.hpp"
+#include "verbose.hpp"
 
 using namespace std;
 
@@ -66,6 +67,15 @@ SocketOption::Mode SrtConfigurePre(SRTSOCKET socket, string host, map<string, st
         fails.push_back("mode");
     }
 
+    if (options.count("linger"))
+    {
+        linger lin;
+        lin.l_linger = stoi(options["linger"]);
+        lin.l_onoff  = lin.l_linger > 0 ? 1 : 0;
+        srt_setsockopt(socket, SocketOption::PRE, SRTO_LINGER, &lin, sizeof(linger));
+    }
+
+
     bool all_clear = true;
     for (auto o: srt_options)
     {
@@ -94,6 +104,7 @@ void SrtConfigurePost(SRTSOCKET socket, map<string, string> options, vector<stri
         if ( o.binding == SocketOption::POST && options.count(o.name) )
         {
             string value = options.at(o.name);
+            Verb() << "Setting option: " << o.name << " = " << value;
             bool ok = o.apply<SocketOption::SRT>(socket, value);
             if ( !ok )
                 fails.push_back(o.name);

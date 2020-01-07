@@ -63,9 +63,10 @@ modified by
    // #include <winsock2.h>
    //#include <windows.h>
 #endif
-#include <pthread.h>
+
 #include "udt.h"
 #include "utilities.h"
+#include "sync.h"
 
 
 #ifdef _DEBUG
@@ -74,6 +75,95 @@ modified by
 #else
 #define SRT_ASSERT(cond)
 #endif
+
+#include <exception>
+
+// Class CUDTException exposed for C++ API.
+// This is actually useless, unless you'd use a DIRECT C++ API,
+// however there's no such API so far. The current C++ API for UDT/SRT
+// is predicted to NEVER LET ANY EXCEPTION out of implementation,
+// so it's useless to catch this exception anyway.
+
+class UDT_API CUDTException: public std::exception
+{
+public:
+
+    CUDTException(CodeMajor major = MJ_SUCCESS, CodeMinor minor = MN_NONE, int err = -1);
+    virtual ~CUDTException() ATR_NOTHROW {}
+
+    /// Get the description of the exception.
+    /// @return Text message for the exception description.
+    const char* getErrorMessage() const ATR_NOTHROW;
+
+    virtual const char* what() const ATR_NOTHROW ATR_OVERRIDE
+    {
+        return getErrorMessage();
+    }
+
+    /// Get the system errno for the exception.
+    /// @return errno.
+    int getErrorCode() const;
+
+    /// Get the system network errno for the exception.
+    /// @return errno.
+    int getErrno() const;
+
+    /// Clear the error code.
+    void clear();
+
+private:
+    CodeMajor m_iMajor;        // major exception categories
+    CodeMinor m_iMinor;		// for specific error reasons
+    int m_iErrno;		// errno returned by the system if there is any
+    mutable std::string m_strMsg; // text error message (cache)
+
+    std::string m_strAPI;	// the name of UDT function that returns the error
+    std::string m_strDebug;	// debug information, set to the original place that causes the error
+
+public: // Legacy Error Code
+
+    static const int EUNKNOWN = SRT_EUNKNOWN;
+    static const int SUCCESS = SRT_SUCCESS;
+    static const int ECONNSETUP = SRT_ECONNSETUP;
+    static const int ENOSERVER = SRT_ENOSERVER;
+    static const int ECONNREJ = SRT_ECONNREJ;
+    static const int ESOCKFAIL = SRT_ESOCKFAIL;
+    static const int ESECFAIL = SRT_ESECFAIL;
+    static const int ECONNFAIL = SRT_ECONNFAIL;
+    static const int ECONNLOST = SRT_ECONNLOST;
+    static const int ENOCONN = SRT_ENOCONN;
+    static const int ERESOURCE = SRT_ERESOURCE;
+    static const int ETHREAD = SRT_ETHREAD;
+    static const int ENOBUF = SRT_ENOBUF;
+    static const int EFILE = SRT_EFILE;
+    static const int EINVRDOFF = SRT_EINVRDOFF;
+    static const int ERDPERM = SRT_ERDPERM;
+    static const int EINVWROFF = SRT_EINVWROFF;
+    static const int EWRPERM = SRT_EWRPERM;
+    static const int EINVOP = SRT_EINVOP;
+    static const int EBOUNDSOCK = SRT_EBOUNDSOCK;
+    static const int ECONNSOCK = SRT_ECONNSOCK;
+    static const int EINVPARAM = SRT_EINVPARAM;
+    static const int EINVSOCK = SRT_EINVSOCK;
+    static const int EUNBOUNDSOCK = SRT_EUNBOUNDSOCK;
+    static const int ESTREAMILL = SRT_EINVALMSGAPI;
+    static const int EDGRAMILL = SRT_EINVALBUFFERAPI;
+    static const int ENOLISTEN = SRT_ENOLISTEN;
+    static const int ERDVNOSERV = SRT_ERDVNOSERV;
+    static const int ERDVUNBOUND = SRT_ERDVUNBOUND;
+    static const int EINVALMSGAPI = SRT_EINVALMSGAPI;
+    static const int EINVALBUFFERAPI = SRT_EINVALBUFFERAPI;
+    static const int EDUPLISTEN = SRT_EDUPLISTEN;
+    static const int ELARGEMSG = SRT_ELARGEMSG;
+    static const int EINVPOLLID = SRT_EINVPOLLID;
+    static const int EASYNCFAIL = SRT_EASYNCFAIL;
+    static const int EASYNCSND = SRT_EASYNCSND;
+    static const int EASYNCRCV = SRT_EASYNCRCV;
+    static const int ETIMEOUT = SRT_ETIMEOUT;
+    static const int ECONGEST = SRT_ECONGEST;
+    static const int EPEERERR = SRT_EPEERERR;
+};
+
 
 
 enum UDTSockType
@@ -156,13 +246,15 @@ enum EConnectStatus
     CONN_REJECT = -1,    //< Error during processing handshake.
     CONN_CONTINUE = 1,   //< induction->conclusion phase
     CONN_RENDEZVOUS = 2, //< pass to a separate rendezvous processing (HSv5 only)
+    CONN_CONFUSED = 3,   //< listener thinks it's connected, but caller missed conclusion
+    CONN_RUNNING = 10,   //< no connection in progress, already connected
     CONN_AGAIN = -2      //< No data was read, don't change any state.
 };
 
 std::string ConnectStatusStr(EConnectStatus est);
 
 
-const int64_t BW_INFINITE =  30000000/8;         //Infinite=> 30Mbps
+const int64_t BW_INFINITE =  1000000000/8;         //Infinite=> 1 Gbps
 
 
 enum ETransmissionEvent
@@ -208,7 +300,7 @@ struct EventVariant
     union U
     {
         CPacket* packet;
-        uint32_t ack;
+        int32_t ack;
         struct
         {
             int32_t* ptr;
@@ -236,7 +328,7 @@ struct EventVariant
     }
 
     void operator=(CPacket* arg) { Assign<PACKET>(arg); };
-    void operator=(uint32_t arg) { Assign<ACK>(arg); };
+    void operator=(int32_t  arg) { Assign<ACK>(arg); };
     void operator=(ECheckTimerStage arg) { Assign<STAGE>(arg); };
     void operator=(EInitEvent arg) { Assign<INIT>(arg); };
 
@@ -321,7 +413,7 @@ template<> struct EventVariant::VariantFor<EventVariant::PACKET>
 
 template<> struct EventVariant::VariantFor<EventVariant::ACK>
 {
-    typedef uint32_t type;
+    typedef int32_t type;
     static type U::*field() { return &U::ack; }
 };
 
@@ -441,15 +533,10 @@ public:
 
 public:
 
-      /// Sleep for "interval" CCs.
-      /// @param [in] interval CCs to sleep.
+      /// Seelp until CC "nexttime_tk".
+      /// @param [in] nexttime_tk next time the caller is waken up.
 
-   void sleep(uint64_t interval);
-
-      /// Seelp until CC "nexttime".
-      /// @param [in] nexttime next time the caller is waken up.
-
-   void sleepto(uint64_t nexttime);
+   void sleepto(const srt::sync::steady_clock::time_point &nexttime);
 
       /// Stop the sleep() or sleepto() methods.
 
@@ -460,21 +547,6 @@ public:
    void tick();
 
 public:
-
-      /// Read the CPU clock cycle into x.
-      /// @param [out] x to record cpu clock cycles.
-
-   static void rdtsc(uint64_t &x);
-
-      /// return the CPU frequency.
-      /// @return CPU frequency.
-
-   static uint64_t getCPUFrequency();
-
-      /// check the current time, 64bit, in microseconds.
-      /// @return current time in microseconds.
-
-   static uint64_t getTime();
 
       /// trigger an event such as new connection, close, new data, etc. for "select" call.
 
@@ -503,21 +575,13 @@ public:
    static int condTimedWaitUS(pthread_cond_t* cond, pthread_mutex_t* mutex, uint64_t delay);
 
 private:
-   uint64_t getTimeInMicroSec();
-
-private:
-   uint64_t m_ullSchedTime;             // next schedulled time
+   srt::sync::steady_clock::time_point m_tsSchedTime;             // next schedulled time
 
    pthread_cond_t m_TickCond;
    pthread_mutex_t m_TickLock;
 
    static pthread_cond_t m_EventCond;
    static pthread_mutex_t m_EventLock;
-
-private:
-   static uint64_t s_ullCPUFrequency;	// CPU frequency : clock cycles per microsecond
-   static uint64_t readCPUFrequency();
-   static bool m_bUseMicroSecond;       // No higher resolution timer available, use gettimeofday().
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -587,12 +651,42 @@ public:
 class CSeqNo
 {
 public:
+
+   /// This behaves like seq1 - seq2, in comparison to numbers,
+   /// and with the statement that only the sign of the result matters.
+   /// That is, it returns a negative value if seq1 < seq2,
+   /// positive if seq1 > seq2, and zero if they are equal.
+   /// The only correct application of this function is when you
+   /// compare two values and it works faster than seqoff. However
+   /// the result's meaning is only in its sign. DO NOT USE THE
+   /// VALUE for any other purpose. It is not meant to be the
+   /// distance between two sequence numbers.
+   ///
+   /// Example: to check if (seq1 %> seq2): seqcmp(seq1, seq2) > 0.
    inline static int seqcmp(int32_t seq1, int32_t seq2)
    {return (abs(seq1 - seq2) < m_iSeqNoTH) ? (seq1 - seq2) : (seq2 - seq1);}
 
+   /// This function measures a length of the range from seq1 to seq2,
+   /// WITH A PRECONDITION that certainly @a seq1 is earlier than @a seq2.
+   /// This can also include an enormously large distance between them,
+   /// that is, exceeding the m_iSeqNoTH value (can be also used to test
+   /// if this distance is larger). Prior to calling this function the
+   /// caller must be certain that @a seq2 is a sequence coming from a
+   /// later time than @a seq1, and still, of course, this distance didn't
+   /// exceed m_iMaxSeqNo.
    inline static int seqlen(int32_t seq1, int32_t seq2)
    {return (seq1 <= seq2) ? (seq2 - seq1 + 1) : (seq2 - seq1 + m_iMaxSeqNo + 2);}
 
+   /// This behaves like seq2 - seq1, with the precondition that the true
+   /// distance between two sequence numbers never exceeds m_iSeqNoTH.
+   /// That is, if the difference in numeric values of these two arguments
+   /// exceeds m_iSeqNoTH, it is treated as if the later of these two
+   /// sequence numbers has overflown and actually a segment of the
+   /// MAX+1 value should be added to it to get the proper result.
+   ///
+   /// Note: this function does more calculations than seqcmp, so it should
+   /// be used if you need the exact distance between two sequences. If 
+   /// you are only interested with their relationship, use seqcmp.
    inline static int seqoff(int32_t seq1, int32_t seq2)
    {
       if (abs(seq1 - seq2) < m_iSeqNoTH)
@@ -796,11 +890,9 @@ inline int32_t SrtParseVersion(const char* v)
     int major, minor, patch;
     int result = sscanf(v, "%d.%d.%d", &major, &minor, &patch);
 
-    if ( result != 3 )
+    if (result != 3)
     {
         return 0;
-        fprintf(stderr, "Invalid version format for HAISRT_VERSION: %s - use m.n.p\n", v);
-        throw v; // Throwing exception, as this function will be run before main()
     }
 
     return major*0x10000 + minor*0x100 + patch;

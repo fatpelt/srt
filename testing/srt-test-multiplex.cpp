@@ -23,8 +23,8 @@
 #include "uriparser.hpp"  // UriParser
 #include "socketoptions.hpp"
 #include "logsupport.hpp"
-#include "transmitbase.hpp"
-#include "transmitmedia.hpp"
+#include "testmediabase.hpp"
+#include "testmedia.hpp"
 #include "netinet_any.h"
 #include "threadname.h"
 #include "verbose.hpp"
@@ -47,7 +47,6 @@ using namespace std;
 // So far, this function must be used and up to this length of payload.
 const size_t DEFAULT_CHUNK = 1316;
 
-const srt_logging::LogFA SRT_LOGFA_APP = 10;
 srt_logging::Logger applog(SRT_LOGFA_APP, srt_logger_config, "srt-mplex");
 
 volatile bool siplex_int_state = false;
@@ -105,7 +104,7 @@ struct MediumPair
 
         if (!initial_portion.empty())
         {
-            tar->Write(initial_portion.data(), initial_portion.size());
+            tar->Write(initial_portion);
             if (tar->Broken())
             {
                 applog.Note() << "OUTPUT BROKEN for loop: " << name;
@@ -120,8 +119,7 @@ struct MediumPair
             {
                 ostringstream sout;
                 alarm(1);
-                bytevector data;
-                const int read_res = src->Read(chunk, data);
+                bytevector data = src->Read(chunk);
 
                 alarm(0);
                 if (alarm_state)
@@ -132,14 +130,14 @@ struct MediumPair
                         break;
                     continue;
                 }
-                sout << " << " << read_res << "  ->  ";
-                if (read_res <= 0 || (data.empty() && src->End()))
+                sout << " << " << data.size() << "  ->  ";
+                if ( data.empty() && src->End() )
                 {
                     sout << "EOS";
                     applog.Note() << sout.str();
                     break;
                 }
-                tar->Write(data.data(), data.size());
+                tar->Write(data);
                 if (tar->Broken())
                 {
                     sout << " OUTPUT broken";
@@ -472,6 +470,7 @@ int main( int argc, char** argv )
         { {"i"}, OptionScheme::ARG_VAR },
         { {"o"}, OptionScheme::ARG_VAR }
     };
+
     map<string, vector<string>> params = ProcessOptions(argv, argc, optargs);
 
     // The call syntax is:
@@ -566,9 +565,9 @@ int main( int argc, char** argv )
     }
 
     int iport = atoi(up.port().c_str());
-    if ( iport <= 1024 )
+    if ( iport < 1024 )
     {
-        cerr << "Port value invalid: " << iport << " - must be >1024\n";
+        cerr << "Port value invalid: " << iport << " - must be >=1024\n";
         return 1;
     }
 

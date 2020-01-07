@@ -53,7 +53,7 @@ modified by
 #ifndef __UDT_CHANNEL_H__
 #define __UDT_CHANNEL_H__
 
-
+#include "platform_sys.h"
 #include "udt.h"
 #include "packet.h"
 #include "netinet_any.h"
@@ -169,7 +169,7 @@ private:
    void setUDPSockOpt();
 
 private:
-   int m_iIPversion;                    // IP version
+   const int m_iIPversion;              // IP version
    int m_iSockAddrSize;                 // socket address structure size (pre-defined to avoid run-time test)
 
    UDPSOCKET m_iSocket;                 // socket descriptor
